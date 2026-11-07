@@ -1,0 +1,3 @@
+# Apple NVMe (106b:2003) at 01:00.0: keep it out of D3cold, otherwise it does not
+# come back from suspend on this model.
+ACTION=="add", SUBSYSTEM=="pci", KERNEL=="0000:01:00.0", ATTR{vendor}=="0x106b", ATTR{d3cold_allowed}="0"

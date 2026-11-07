@@ -1,0 +1,35 @@
+--- a/howdy/src/recorders/video_capture.py
++++ b/howdy/src/recorders/video_capture.py
+@@ -96,6 +96,15 @@
+ 			raise
+ 		return frame, gsframe
+ 
++	def _v4l_lit(self):
++		"""
++		True if V4L2 opens the camera and returns a frame
++		"""
++		if not self.internal.isOpened():
++			return False
++		ok, _frame = self.internal.read()
++		return bool(ok)
++
+ 	def _create_reader(self):
+ 		"""
+ 		Sets up the video reader instance
+@@ -124,6 +133,16 @@
+ 				self.config.get("video", "device_path"),
+ 				cv2.CAP_V4L
+ 			)
++			# H.264-only camera (MacBookPro13/14, uvcvideo-t1): V4L2 returns no frame, fall back to GStreamer
++			if not self._v4l_lit():
++				self.internal.release()
++				self.internal = cv2.VideoCapture(
++					"v4l2src device=" + self.config.get("video", "device_path") +
++					" ! video/x-h264 ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=BGR"
++					" ! appsink drop=true max-buffers=1 sync=false",
++					cv2.CAP_GSTREAMER
++				)
++				return
+ 			# Set the capture frame rate
+ 			# Without this the first detected (and possibly lower) frame rate is used, -1 seems to select the highest
+ 			# Use 0 as a fallback to avoid breaking an existing setup, new installs should default to -1

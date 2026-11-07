@@ -1,0 +1,139 @@
+--- a/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
++++ b/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
+@@ -0,0 +1 @@
++// Fn inverted (F row without Fn, controls with Fn): Fn booleans flipped in the 2 tests that target the F row
+@@ -113 +114 @@
+-        .observe_input(input(1, false, vec![contact(1, 13, 8)]))
++        .observe_input(input(1, true, vec![contact(1, 13, 8)]))
+@@ -148 +149 @@
+-    let outcome = session.observe_input(input(2, false, Vec::new())).unwrap();
++    let outcome = session.observe_input(input(2, true, Vec::new())).unwrap();
+@@ -152 +153 @@
+-        .observe_input(input(3, false, vec![contact(2, 13, 8)]))
++        .observe_input(input(3, true, vec![contact(2, 13, 8)]))
+@@ -182 +183 @@
+-    session.observe_input(input(1, true, held.clone())).unwrap();
++    session.observe_input(input(1, false, held.clone())).unwrap();
+@@ -187 +188 @@
+-            .observe_input(input(timestamp, true, contacts))
++            .observe_input(input(timestamp, false, contacts))
+@@ -195 +196 @@
+-        .observe_input(input(5, true, vec![contact(3, 60, 10)]))
++        .observe_input(input(5, false, vec![contact(3, 60, 10)]))
+--- a/crates/t1-touchbar/src/builtin_renderer.rs
++++ b/crates/t1-touchbar/src/builtin_renderer.rs
+@@ -1040 +1040 @@
+-            fn_pressed: false,
++            fn_pressed: true, // F-key row shown from the first frame
+@@ -1084,2 +1084,5 @@
+-        let mut redraw = self.fn_pressed != frame.fn_pressed;
+-        self.fn_pressed = frame.fn_pressed;
++        // F-key row (Esc + F1-F12) by default; brightness, volume and media controls while Fn is held
++        // (Fn held: controls instead)
++        let fn_pressed = !frame.fn_pressed;
++        let mut redraw = self.fn_pressed != fn_pressed;
++        self.fn_pressed = fn_pressed;
+@@ -1238,0 +1242 @@
++    // tests adjusted: the F row is the state without Fn (Fn held = controls)
+@@ -1480 +1484 @@
+-            .ingest(&input(1, false, vec![contact(1, 60, 10)]), None)
++            .ingest(&input(1, true, vec![contact(1, 60, 10)]), None)
+@@ -1496 +1500 @@
+-            .ingest(&input(2, false, Vec::new()), None)
++            .ingest(&input(2, true, Vec::new()), None)
+@@ -1839 +1843 @@
+-                .ingest(&input(1, true, Vec::new()), None)
++                .ingest(&input(1, false, Vec::new()), None)
+@@ -1842 +1846 @@
+-                redraw: true,
++                redraw: false, // F row already shown without Fn
+@@ -1850 +1854 @@
+-                .ingest(&input(2, true, vec![contact(4, 15, 8)]), None)
++                .ingest(&input(2, false, vec![contact(4, 15, 8)]), None)
+@@ -1857 +1861 @@
+-                .ingest(&input(3, true, Vec::new()), None)
++                .ingest(&input(3, false, Vec::new()), None)
+@@ -1868 +1872 @@
+-            .ingest(&input(1, false, vec![contact(1, 4, 8)]), None)
++            .ingest(&input(1, true, vec![contact(1, 4, 8)]), None)
+@@ -1872 +1876 @@
+-                .ingest(&input(2, false, Vec::new()), None)
++                .ingest(&input(2, true, Vec::new()), None)
+@@ -1878 +1882 @@
+-            .ingest(&input(3, false, vec![contact(2, 15, 8)]), None)
++            .ingest(&input(3, true, vec![contact(2, 15, 8)]), None)
+@@ -1882 +1886 @@
+-                .ingest(&input(4, false, Vec::new()), None)
++                .ingest(&input(4, true, Vec::new()), None)
+@@ -1893 +1897 @@
+-            .ingest(&input(1, true, vec![contact(1, 15, 8)]), None)
++            .ingest(&input(1, false, vec![contact(1, 15, 8)]), None)
+@@ -1896 +1900 @@
+-            .ingest(&input(2, true, vec![contact(1, 80, 8)]), None)
++            .ingest(&input(2, false, vec![contact(1, 80, 8)]), None)
+@@ -1900 +1904 @@
+-                .ingest(&input(3, true, Vec::new()), None)
++                .ingest(&input(3, false, Vec::new()), None)
+@@ -1908 +1912 @@
+-                &input(4, true, vec![contact(2, 15, 8), contact(3, 16, 8)]),
++                &input(4, false, vec![contact(2, 15, 8), contact(3, 16, 8)]),
+@@ -1914 +1918 @@
+-                .ingest(&input(5, true, Vec::new()), None)
++                .ingest(&input(5, false, Vec::new()), None)
+@@ -1927 +1931 @@
+-                &input(1, false, vec![contact(1, 24, 10), contact(2, 25, 10)]),
++                &input(1, true, vec![contact(1, 24, 10), contact(2, 25, 10)]),
+@@ -1934 +1938 @@
+-            .ingest(&input(2, false, Vec::new()), active)
++            .ingest(&input(2, true, Vec::new()), active)
+@@ -1941 +1945 @@
+-            .ingest(&input(1, false, vec![contact(1, 24, 10)]), None)
++            .ingest(&input(1, true, vec![contact(1, 24, 10)]), None)
+@@ -1945 +1949 @@
+-                .ingest(&input(2, false, Vec::new()), None)
++                .ingest(&input(2, true, Vec::new()), None)
+@@ -1953 +1957 @@
+-                .ingest(&input(1, false, vec![contact(1, 60, 10)]), active)
++                .ingest(&input(1, true, vec![contact(1, 60, 10)]), active)
+@@ -1959 +1963 @@
+-                .ingest(&input(2, false, Vec::new()), active)
++                .ingest(&input(2, true, Vec::new()), active)
+@@ -1967 +1971 @@
+-                .ingest(&input(1, false, vec![contact(1, 24, 10)]), active)
++                .ingest(&input(1, true, vec![contact(1, 24, 10)]), active)
+@@ -1972 +1976 @@
+-            .ingest(&input(2, false, vec![contact(1, 80, 10)]), active)
++            .ingest(&input(2, true, vec![contact(1, 80, 10)]), active)
+@@ -1976 +1980 @@
+-                .ingest(&input(3, false, Vec::new()), active)
++                .ingest(&input(3, true, Vec::new()), active)
+@@ -1984 +1988 @@
+-                .ingest(&input(1, true, vec![contact(1, 80, 8)]), active)
++                .ingest(&input(1, false, vec![contact(1, 80, 8)]), active)
+@@ -1989 +1993 @@
+-            .ingest(&input(2, true, Vec::new()), active)
++            .ingest(&input(2, false, Vec::new()), active)
+@@ -2002 +2006 @@
+-                    &input(1, false, held.clone()),
++                    &input(1, true, held.clone()),
+@@ -2010 +2014 @@
+-                .ingest(&input(2, false, held.clone()), None)
++                .ingest(&input(2, true, held.clone()), None)
+@@ -2016 +2020 @@
+-                .ingest(&input(3, false, held), Some(OverlayState::Approve))
++                .ingest(&input(3, true, held), Some(OverlayState::Approve))
+@@ -2022 +2026 @@
+-                .ingest(&input(4, false, Vec::new()), Some(OverlayState::Approve))
++                .ingest(&input(4, true, Vec::new()), Some(OverlayState::Approve))
+@@ -2029 +2033 @@
+-                &input(5, false, vec![contact(2, 4, 10)]),
++                &input(5, true, vec![contact(2, 4, 10)]),
+@@ -2036 +2040 @@
+-                &input(6, false, Vec::new()),
++                &input(6, true, Vec::new()),
+@@ -2057 +2061 @@
+-            .ingest_at(&input(1, false, vec![held]), None, Duration::ZERO)
++            .ingest_at(&input(1, true, vec![held]), None, Duration::ZERO)
+@@ -2078 +2082 @@
+-                    &input(2, false, Vec::new()),
++                    &input(2, true, Vec::new()),
