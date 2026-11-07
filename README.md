@@ -1,32 +1,39 @@
-# debian-macbook-t1
+# Debian on MacBook Pro 2016 with Touch Bar (T1): MacBookPro13,2 scripts
 
-Scripts and small patches that make a **MacBookPro13,2** (2016 13-inch with Touch Bar,
-Apple **T1** chip, PCI Wi-Fi BCM43602) work under **Debian 13 (trixie)**.
-Everything here was run by hand on one machine of that model, with kernel 7.2.x;
-nothing is claimed for other models.
+**Debian 13 (trixie) on the MacBook Pro 13-inch 2016 with Touch Bar (MacBookPro13,2, Apple T1 chip):**
+Touch Bar with F1-F12 by default, Touch ID fingerprint login, Howdy face unlock with the H.264-only
+camera, Wi-Fi 5 GHz (Broadcom BCM43602 `brcmfmac` NVRAM), power-button handling and firewall rule for
+the T1 link. Scripts and small patches only; [t1bridge](https://github.com/standardagents/t1bridge),
+[Howdy](https://github.com/boltgolt/howdy) and the Wi-Fi NVRAM come from their own sources
+(see [THIRD_PARTY.md](THIRD_PARTY.md)).
 
-This repository holds scripts and patches only. t1bridge, Howdy and the Wi-Fi NVRAM are
-fetched from their own sources (see [THIRD_PARTY.md](THIRD_PARTY.md)).
+> **Status: v0.1.0, early.** Everything was run by hand on **one** machine, a MacBookPro13,2 on kernel 7.2.x.
+> `install.sh` has only been verified in simulation (`--dry-run`), not run end to end.
 
-## What works (measured on the machine)
+## Which models
 
-- **Touch Bar** through [t1bridge](https://github.com/standardagents/t1bridge) v0.1.12:
-  Esc + F1-F12 shown **by default**, brightness / volume / media while Fn is held
-  (patch in `patches/`; the t1bridge test suite passes with it: 95 tests).
-- **Touch ID** (enrolled with `fprintd-enroll`, offered by PAM next to face and password).
-- **Face unlock with Howdy**: the built-in camera only delivers H.264, so V4L2 cannot read
-  it; the patch adds a GStreamer fallback (a 720x1280 frame in under a second).
-- **Wi-Fi 5 GHz** (BCM43602) once a NVRAM file carrying the card's own MAC is installed.
-- Keyboard and trackpad (applespi), battery and SMC, NVMe disk.
+| Model | Status |
+|---|---|
+| **MacBookPro13,2** (13-inch 2016, Touch Bar) | **Tested** (the only one) |
+| MacBookPro13,3 (15-inch 2016) | Probably compatible, **not tested** |
+| MacBookPro14,2 (13-inch 2017, Touch Bar) | Probably compatible, **not tested** |
+| MacBookPro14,3 (15-inch 2017) | Probably compatible, **not tested** |
 
-## Known issues (under test, no conclusion yet)
+`install.sh` refuses other models unless you pass `--force`.
 
-- **Wi-Fi 2.4 GHz**: networks are seen but the association does not complete (the 4-way
-  handshake fails with the NVRAM above). The same symptom is reported in the kernel bugzilla
-  thread that holds the NVRAM attachment. Tests are in progress; nothing here fixes it.
-- **Sleep / resume**: not reliable yet. Tests are in progress (PCIe D3cold on bridges, Thunderbolt and
-  Wi-Fi). Only the NVMe D3cold rule is applied by `install.sh`.
-- Sound (Cirrus CS8409) and the camera outside Howdy were not part of these tests.
+## What works and what does not (MacBookPro13,2)
+
+| Feature | Status | Notes |
+|---|---|---|
+| Touch Bar, F1-F12 by default | Works | t1bridge v0.1.12 + patch; Fn gives brightness / volume / media |
+| Touch ID (fingerprint) | Works | enrolled with `fprintd-enroll`, offered by PAM |
+| Face unlock (Howdy) | Works | GStreamer fallback, the camera only gives H.264 |
+| Wi-Fi 5 GHz (BCM43602) | Works | needs the NVRAM file with your MAC |
+| Keyboard, trackpad, battery, SMC, NVMe | Works | |
+| Power button = Touch ID sensor | Handled | logind ignores the key |
+| Wi-Fi 2.4 GHz | **Known issue**, being tested | networks are seen, association fails |
+| Sleep / resume | **Known issue**, being tested | not reliable yet |
+| Sound (CS8409), camera outside Howdy | Not tested | |
 
 ## Install
 
@@ -36,7 +43,7 @@ sudo ./install.sh --dry-run          # shows what would change
 sudo ./install.sh --wifi-mac AA:BB:CC:DD:EE:FF --t1bridge-src /path/to/t1bridge
 ```
 
-`install.sh` is idempotent (run it again, it only changes what differs). Options:
+`install.sh` is written to be idempotent (run it again, it only changes what differs), but it has **only been verified in `--dry-run`** so far. Options:
 
 | Option | Effect |
 |---|---|
