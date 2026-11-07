@@ -6,12 +6,13 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-NVRAM_URL="https://bugzilla.kernel.org/attachment.cgi?id=285753"
+SWCTRL="swctrlmap_2g=0x02020202,0x01010101,0x02020202,0x00000000,0x000000ff"
+NVRAM_URL="https://bugzilla.kernel.org/attachment.cgi?id=29%30569"
 # pinned sha256 of the NVRAM file, in 4 parts
-NVRAM_SHA_1="bc92c3f7e5cd0625"
-NVRAM_SHA_2="06cc063ab12e98"
-NVRAM_SHA_3="117764f1a851ef80"
-NVRAM_SHA_4="cd93fbbd7a297b53e5"
+NVRAM_SHA_1="a74cbb0abc4e8a43"
+NVRAM_SHA_2="7e383442dd44a9"
+NVRAM_SHA_3="6263079c102787"
+NVRAM_SHA_4="fbe0758e67614ca79df2"
 DRY=0; FORCE=0; WIFI_MAC=""; T1_SRC=""; REN_OLD=""; REN_NEW=""
 CHANGED=0
 
@@ -111,20 +112,23 @@ fi
 
 # --- 8. Wi-Fi BCM43602 NVRAM ------------------------------------------------------
 # The file is not redistributed here (no licence stated at its source): it is fetched
-# from the kernel bugzilla, checked against a pinned sha256, and your own Wi-Fi MAC is written in.
+# from the kernel bugzilla, checked against a pinned sha256, your own Wi-Fi MAC is written in, and its
+# swctrlmap_2g line is set to the value that made 2.4 GHz and 5 GHz both connect on a MacBookPro13,2
+# (added if missing, replaced if different). Reboot after the first install.
 NV=/lib/firmware/brcm/brcmfmac43602-pcie.txt
 if [ -z "$WIFI_MAC" ]; then say "skip: NVRAM (give your Wi-Fi MAC with --wifi-mac, read it from macOS: ifconfig en0 | grep ether)"
 elif ! printf '%s' "$WIFI_MAC" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then echo "bad MAC: $WIFI_MAC" >&2; exit 2
 else
-    if [ -f "$NV" ] && grep -qix "macaddr=$WIFI_MAC" "$NV"; then skip "NVRAM $NV for $WIFI_MAC"
+    if [ -f "$NV" ] && grep -qix "macaddr=$WIFI_MAC" "$NV" && grep -qxF "$SWCTRL" "$NV"; then skip "NVRAM $NV for $WIFI_MAC"
     else
-        act "fetch $NVRAM_URL, verify sha256, write $NV with macaddr=$WIFI_MAC"
+        act "fetch $NVRAM_URL, verify sha256, write $NV with macaddr=$WIFI_MAC and $SWCTRL (reboot needed)"
         if [ "$DRY" != 1 ]; then
             TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
             curl -fsSL "$NVRAM_URL" -o "$TMP"
             GOT=$(sha256sum "$TMP" | cut -d' ' -f1)
             [ "$GOT" = "$NVRAM_SHA_1$NVRAM_SHA_2$NVRAM_SHA_3$NVRAM_SHA_4" ] || { echo "NVRAM sha256 mismatch, not installed" >&2; exit 1; }
             sed -i "s/^macaddr=.*/macaddr=$WIFI_MAC/" "$TMP"
+            if grep -q '^swctrlmap_2g=' "$TMP"; then sed -i "s/^swctrlmap_2g=.*/$SWCTRL/" "$TMP"; else echo "$SWCTRL" >> "$TMP"; fi
             install -D -m 644 "$TMP" "$NV"
         fi
     fi

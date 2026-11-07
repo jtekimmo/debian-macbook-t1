@@ -2,7 +2,7 @@
 
 **Debian 13 (trixie) on the MacBook Pro 13-inch 2016 with Touch Bar (MacBookPro13,2, Apple T1 chip):**
 Touch Bar with F1-F12 by default, Touch ID fingerprint login, Howdy face unlock with the H.264-only
-camera, Wi-Fi 5 GHz (Broadcom BCM43602 `brcmfmac` NVRAM), power-button handling and firewall rule for
+camera, Wi-Fi 2.4 GHz and 5 GHz (Broadcom BCM43602 `brcmfmac` NVRAM), power-button handling and firewall rule for
 the T1 link. Scripts and small patches only; [t1bridge](https://github.com/standardagents/t1bridge),
 [Howdy](https://github.com/boltgolt/howdy) and the Wi-Fi NVRAM come from their own sources
 (see [THIRD_PARTY.md](THIRD_PARTY.md)).
@@ -28,11 +28,10 @@ the T1 link. Scripts and small patches only; [t1bridge](https://github.com/stand
 | Touch Bar, F1-F12 by default | Works | t1bridge v0.1.12 + patch; Fn gives brightness / volume / media |
 | Touch ID (fingerprint) | Works | enrolled with `fprintd-enroll`, offered by PAM |
 | Face unlock (Howdy) | Works | GStreamer fallback, the camera only gives H.264 |
-| Wi-Fi 5 GHz (BCM43602) | Works | needs the NVRAM file with your MAC |
+| Wi-Fi 2.4 GHz and 5 GHz (BCM43602) | Works | needs the NVRAM file with your MAC and the `swctrlmap_2g` line that `install.sh` sets; **requires a reboot after install**; both bands connect in the same boot (3 rounds, and it holds after a reboot) |
 | Keyboard, trackpad, battery, SMC, NVMe | Works | |
 | Power button = Touch ID sensor | Handled | logind ignores the key |
-| Wi-Fi 2.4 GHz | **Known issue**, being tested | networks are seen, association fails |
-| Sleep / resume | **Known issue**, being tested | not reliable yet |
+| Sleep / resume | **Known issue**, being tested | after a wake-up the 5 GHz band is lost until a reboot. Setting `d3cold_allowed=0` on the PCIe bridges prevents the wake-up: **do not do it** (only the NVMe rule is applied) |
 | Sound (CS8409), camera outside Howdy | Not tested | |
 
 ## Install
@@ -49,7 +48,7 @@ sudo ./install.sh --wifi-mac AA:BB:CC:DD:EE:FF --t1bridge-src /path/to/t1bridge
 |---|---|
 | `--dry-run` | print the changes, touch nothing |
 | `--force` | go on even if the DMI model is not MacBookPro13,2 |
-| `--wifi-mac MAC` | fetch the BCM43602 NVRAM, verify its sha256, write your MAC in (read it from macOS with `ifconfig en0 | grep ether`) |
+| `--wifi-mac MAC` | fetch the BCM43602 NVRAM, verify its sha256, write your MAC in and set the `swctrlmap_2g` line (read it from macOS with `ifconfig en0 | grep ether`) |
 | `--t1bridge-src DIR` | apply the F1-F12 patch to a t1bridge v0.1.12 source tree (you build and install t1bridge yourself, following its documentation) |
 | `--rename-owner OLD NEW` | re-attach an enrolled fingerprint to another Linux account |
 
@@ -65,7 +64,7 @@ What it sets up:
 6. `ufw`: `61500/tcp` allowed from `fe80::/10`, **only** on the interface of the `apple_t1_ncm`
    driver (the private link to the T1, needed by xART / Touch ID). Skipped until that link exists.
 7. udev rule: `d3cold_allowed=0` for the Apple NVMe (`0000:01:00.0`).
-8. Wi-Fi NVRAM as above.
+8. Wi-Fi NVRAM as above (2.4 and 5 GHz; reboot afterwards).
 9. Fingerprint owner rename (`scripts/rename-fingerprint-owner.sh`): the owner name is stored
    in two places (t1bridge `identities.meta`, and the libfprint `FP3` print). The script
    edits both after a backup and restores it if its final check fails. It was run once by hand;
