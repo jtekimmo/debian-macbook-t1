@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# photos-iphone : copie les photos et videos d un iPhone (USB) dans ~/google/Foto/camera/AAAA/
+# sous le nom standard AAAAMMJJ_HHMMSS.ext (date de prise), saute tout fichier dont le md5 est
+# deja connu (Drive + passes precedentes), n efface jamais rien de l iPhone, demonte toujours.
+# Lance a la main (icone « Photos iPhone »), jamais en continu : ni service ni regle udev.
+# Variables d essai/reglage : PI_DEST, PI_CACHE, PI_RCLONE_REMOTE, PI_SANS_DRIVE, PI_MNT_BASE.
+set -u
+export LC_ALL=C.UTF-8
+
+# reglage facultatif de l usager : ~/.config/photos-iphone.conf (ex. PI_RCLONE_REMOTE=mydrive:Foto/camera)
+[ -r "${XDG_CONFIG_HOME:-$HOME/.config}/photos-iphone.conf" ] && . "${XDG_CONFIG_HOME:-$HOME/.config}/photos-iphone.conf"
+DEST="${PI_DEST:-$HOME/google/Foto/camera}"
+CACHE_DIR="${PI_CACHE:-$HOME/.cache/photos-iphone}"
+PATHS="$CACHE_DIR/drive.paths"      # chemins relatifs (AAAA/nom.ext) deja dans le Drive ou copies par nous
+VUS="$CACHE_DIR/vus.md5"            # une ligne : md5 (Drive + fichiers deja copies)
+JOURNAL="$CACHE_DIR/journal.jsonl"
+STAGE="$CACHE_DIR/stage"
+RCLONE_REMOTE="${PI_RCLONE_REMOTE:-}"   # ex. mydrive:Foto/camera ; vide = pas de liste Drive (cache seul)
+MNT_BASE="${PI_MNT_BASE:-${XDG_RUNTIME_DIR:-/var/tmp}}"
+WAIT_TRUST="${PI_WAIT_TRUST:-90}"
+
+mkdir -p "$CACHE_DIR" "$STAGE" "$DEST" || { echo "dossiers impossibles" >&2; exit 1; }
+touch "$VUS" "$PATHS"
+
+# ---- messages ------------------------------------------------------------------------------
+note() { command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && notify-send -i phone "Photos iPhone" "$1" 2>/dev/null; echo "$1"; }
+fin_msg() { # $1 = type (info|error), $2 = texte
+    echo "$2"
+    if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        zenity "--$1" --title="Photos iPhone" --no-markup --width=420 --text="$2" 2>/dev/null
+    elif command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        notify-send -i phone "Photos iPhone" "$2" 2>/dev/null
+    fi
+}
+
+# ---- une seule passe a la fois ---------------------------------------------------------------
+exec 9>"$CACHE_DIR/verrou"
+flock -n 9 || { fin_msg error "Photos iPhone est déjà en cours. Attends la fin."; exit 1; }
+
+trap '' PIPE
+MNT=""; MONTE=0; ZPID=""; TICK=""; RCPID=""; ZFIFO="$CACHE_DIR/barre.fifo"; FINI="$CACHE_DIR/fini"
+rm -f "$FINI" "$ZFIFO"
+
+# ---- barre de progression (zenity --progress), fermee a la fin, Annuler = arret propre ---------
+AVEC_BARRE=0
+if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && mkfifo "$ZFIFO" 2>/dev/null; then
+    zenity --progress --title="Photos iPhone" --text="Démarrage…" --percentage=0 --auto-close \
+        --width=480 --ok-label="Fermer" < "$ZFIFO" >/dev/null 2>&1 9>&- &
+    ZPID=$!
+    exec 8>"$ZFIFO" && AVEC_BARRE=1
+    # Annuler (ou fermeture de la fenetre) avant la fin : on arrete la passe proprement (trap TERM)
+    ( exec 8>&- 9>&-; while kill -0 "$ZPID" 2>/dev/null; do sleep 1; done; sleep 1; [ -e "$FINI" ] || kill -TERM $$ 2>/dev/null ) &
+    disown 2>/dev/null
+fi
+barre() { # $1 = pourcentage (0-100), $2 = texte ; ecrit sans jamais echouer (fenetre fermee = SIGPIPE ignore)
+    [ "$AVEC_BARRE" = 1 ] || return 0
+    { [ -n "$1" ] && echo "$1"; echo "# $2"; } >&8 2>/dev/null || true
+}
+pulse_debut() { # texte ; la barre va et vient (le total est inconnu) tant que dure l etape
+    [ "$AVEC_BARRE" = 1 ] || return 0
+    barre 0 "$1"
+    ( exec 9>&-; p=0; d=5; while :; do echo "$p" >&8 2>/dev/null || exit 0; p=$((p + d)); [ $p -ge 100 ] && d=-5; [ $p -le 0 ] && d=5; sleep 0.3; done ) &
+    TICK=$!
+}
+pulse_fin() { [ -n "$TICK" ] && { kill "$TICK" 2>/dev/null; wait "$TICK" 2>/dev/null; TICK=""; }; return 0; }
+
+nettoyer() {
+    local r=0
+    pulse_fin
+    [ -n "$RCPID" ] && kill "$RCPID" 2>/dev/null
+    touch "$FINI" 2>/dev/null
+    if [ "$AVEC_BARRE" = 1 ]; then { echo 100; } >&8 2>/dev/null; exec 8>&- 2>/dev/null; AVEC_BARRE=0; fi
+    [ -n "$ZPID" ] && { wait "$ZPID" 2>/dev/null; ZPID=""; }
+    rm -f "$ZFIFO" "$CACHE_DIR/drive.md5.new" "$CACHE_DIR/liste.tmp"
+    if [ "$MONTE" = 1 ] && [ -n "$MNT" ]; then
+        # demontage : fusermount3 puis fusermount, puis umount paresseux si l iPhone est occupe
+        fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null \
+            || fusermount3 -uz "$MNT" 2>/dev/null || fusermount -uz "$MNT" 2>/dev/null || r=1
+        MONTE=0
+    fi
+    [ -n "$MNT" ] && rmdir "$MNT" 2>/dev/null
+    rm -rf "$STAGE"/* 2>/dev/null
+    return $r
+}
+trap nettoyer EXIT
+ANNULE=0
+trap 'ANNULE=1; exit 130' INT TERM HUP
+trap '' PIPE   # fenetre de la barre fermee (Annuler) : l ecriture echoue sans tuer le script avant son nettoyage
+
+# ---- iPhone present et appaire ---------------------------------------------------------------
+barre 5 "Étape 1 sur 5 – Recherche de l'iPhone…"
+if ! idevice_id -l 2>/dev/null | grep -q .; then
+    fin_msg error "Je ne vois pas l'iPhone. Branche-le avec le câble, déverrouille-le (code), puis relance."
+    exit 1
+fi
+if ! idevicepair validate >/dev/null 2>&1; then
+    note "Déverrouille l'iPhone et appuie sur « Se fier » (Se fier à cet ordinateur)."
+    barre 5 "Étape 1 sur 5 – Déverrouille l'iPhone et appuie sur « Se fier »…"
+    idevicepair pair >/dev/null 2>&1   # fait apparaitre la question sur l iPhone
+    ok=0; t=0
+    while [ "$t" -lt "$WAIT_TRUST" ]; do
+        if idevicepair validate >/dev/null 2>&1; then ok=1; break; fi
+        sleep 3; t=$((t + 3))
+        idevicepair pair >/dev/null 2>&1
+    done
+    if [ "$ok" != 1 ]; then
+        fin_msg error "L'iPhone n'est pas encore de confiance. Déverrouille l'iPhone et appuie sur « Se fier », puis relance Photos iPhone."
+        exit 1
+    fi
+fi
+
+# ---- montage ---------------------------------------------------------------------------------
+barre 15 "Étape 2 sur 5 – Ouverture de l'iPhone…"
+MNT="$(mktemp -d "$MNT_BASE/photos-iphone.XXXXXX")" || { fin_msg error "Dossier de montage impossible."; exit 1; }
+if ! ifuse "$MNT" >/dev/null 2>&1; then
+    fin_msg error "Impossible d'ouvrir l'iPhone. Déverrouille-le, débranche et rebranche le câble, puis relance."
+    exit 1
+fi
+MONTE=1
+if [ ! -d "$MNT/DCIM" ]; then
+    fin_msg error "Aucun dossier de photos (DCIM) sur l'iPhone."
+    exit 1
+fi
+
+# ---- liste md5 du Drive (cache mis a jour a chaque passe) --------------------------------------
+drive_note="cache seul"
+if [ -z "${PI_SANS_DRIVE:-}" ] && [ -n "$RCLONE_REMOTE" ] && command -v rclone >/dev/null 2>&1; then
+    note "Lecture de la liste du Drive…"
+    pulse_debut "Étape 3 sur 5 – Lecture de la liste du Drive (peut durer plusieurs minutes, ne ferme pas)…"
+    nice -n 19 ionice -c3 rclone md5sum "$RCLONE_REMOTE" > "$CACHE_DIR/drive.md5.new" 2>"$CACHE_DIR/rclone.err" &
+    RCPID=$!
+    wait "$RCPID"; rcr=$?; RCPID=""
+    pulse_fin
+    if [ "$rcr" = 0 ]; then
+        awk 'NF>=2 {print tolower($1)}' "$CACHE_DIR/drive.md5.new" | cat - "$VUS" | sort -u > "$VUS.new" && mv "$VUS.new" "$VUS"
+        # chemins du Drive : un nom deja pris la-bas (meme pas encore descendu par la synchro) n est jamais reutilise
+        sed -E 's/^[0-9a-fA-F]{32} +//' "$CACHE_DIR/drive.md5.new" | cat - "$PATHS" | sort -u > "$PATHS.new" && mv "$PATHS.new" "$PATHS"
+        drive_note="Drive lu"
+    else
+        drive_note="Drive illisible, cache seul"
+    fi
+    rm -f "$CACHE_DIR/drive.md5.new"
+fi
+declare -A VU=()
+while read -r h; do [ -n "$h" ] && VU["$h"]=1; done < "$VUS"
+declare -A PU=()
+while IFS= read -r q; do [ -n "$q" ] && PU["$q"]=1; done < "$PATHS"
+
+# ---- date de prise -> AAAAMMJJ_HHMMSS --------------------------------------------------------
+date_prise() { # $1 fichier, $2 extension minuscule ; imprime "AAAAMMJJ_HHMMSS"
+    local f="$1" e="$2" d=""
+    case "$e" in
+        mov|mp4|m4v)
+            # heure locale iPhone avec fuseau (com.apple.quicktime.creationdate), sinon creation_time (UTC)
+            d="$(ffprobe -v error -show_entries format_tags=com.apple.quicktime.creationdate -of default=nw=1:nk=1 "$f" 2>/dev/null | head -1)"
+            if [ -n "$d" ]; then
+                d="$(date -d "$d" +%Y%m%d_%H%M%S 2>/dev/null)"
+            else
+                d="$(ffprobe -v error -show_entries format_tags=creation_time -of default=nw=1:nk=1 "$f" 2>/dev/null | head -1)"
+                [ -n "$d" ] && d="$(date -d "$d" +%Y%m%d_%H%M%S 2>/dev/null)"
+            fi ;;
+        *)
+            d="$(exiftool -s3 -d '%Y%m%d_%H%M%S' -DateTimeOriginal "$f" 2>/dev/null | head -1)"
+            [ -z "$d" ] && d="$(exiftool -s3 -d '%Y%m%d_%H%M%S' -CreateDate "$f" 2>/dev/null | head -1)" ;;
+    esac
+    case "$d" in [0-9][0-9][0-9][0-9][0-1][0-9][0-3][0-9]_[0-2][0-9][0-5][0-9][0-5][0-9]) ;; *) d="" ;; esac
+    [ "$d" = "00000000_000000" ] && d=""
+    if [ -z "$d" ]; then
+        d="$(date -d "@$(stat -c %Y "$f")" +%Y%m%d_%H%M%S)"; echo "mtime:$d"; return
+    fi
+    echo "exif:$d"
+}
+
+jl() { # statut src dest md5 detail
+    printf '{"t":"%s","statut":"%s","src":"%s","dest":"%s","md5":"%s","detail":"%s"}\n' \
+        "$(date -Iseconds)" "$1" "${2//\"/\\\"}" "${3//\"/\\\"}" "$4" "${5//\"/\\\"}" >> "$JOURNAL"
+}
+
+# ---- passe -------------------------------------------------------------------------------------
+copies=0; sautes=0; erreurs=0; vus_total=0; sans_exif=0
+pulse_debut "Étape 4 sur 5 – Lecture des photos de l'iPhone (ça peut prendre une minute)…"
+find "$MNT/DCIM" -type f -print0 2>/dev/null | sort -z > "$CACHE_DIR/liste.tmp"
+pulse_fin
+TOTAL=$(tr -cd '\0' < "$CACHE_DIR/liste.tmp" | wc -c)
+[ "$TOTAL" -gt 0 ] || TOTAL=1
+note "Copie des photos en cours… (ne débranche pas l'iPhone)"
+while IFS= read -r -d '' src; do
+    base="${src##*/}"; ext="${base##*.}"; ext="${ext,,}"
+    case "$ext" in
+        jpg|jpeg|heic|png|mov|mp4|m4v|dng|gif|tif|tiff) ;;
+        *) continue ;;   # .AAE (retouches), .THM, etc.
+    esac
+    [ "$ext" = jpeg ] && ext=jpg
+    [ "$ext" = tiff ] && ext=tif
+    vus_total=$((vus_total + 1))
+    barre $((vus_total * 100 / TOTAL)) "Étape 5 sur 5 – Photo $vus_total sur $TOTAL (copiées : $copies, déjà là : $sautes, erreurs : $erreurs). Ne débranche pas l'iPhone."
+    h="$(md5sum < "$src" 2>/dev/null | awk '{print $1}')"
+    if [ -z "$h" ]; then erreurs=$((erreurs + 1)); jl erreur "$src" "" "" "md5 illisible"; continue; fi
+    if [ -n "${VU[$h]:-}" ]; then sautes=$((sautes + 1)); jl saute "$src" "" "$h" "md5 deja connu"; continue; fi
+    dp="$(date_prise "$src" "$ext")"
+    src_date="${dp%%:*}"; nom="${dp#*:}"
+    [ "$src_date" = mtime ] && sans_exif=$((sans_exif + 1))
+    an="${nom:0:4}"
+    dir="$DEST/$an"
+    mkdir -p "$dir" || { erreurs=$((erreurs + 1)); jl erreur "$src" "" "$h" "mkdir $dir"; continue; }
+    # nom libre sur le disque ET dans le Drive (liste des chemins) ; sinon suffixe _1, _2…
+    cible="$dir/$nom.$ext"; n=0
+    while [ -e "$cible" ] || [ -n "${PU[$an/${cible##*/}]:-}" ]; do n=$((n + 1)); cible="$dir/${nom}_$n.$ext"; done
+    tmp="$STAGE/$h.$ext"
+    if ! cp -- "$src" "$tmp" 2>/dev/null || [ "$(md5sum < "$tmp" | awk '{print $1}')" != "$h" ]; then
+        rm -f "$tmp"; erreurs=$((erreurs + 1)); jl erreur "$src" "" "$h" "copie ou verification md5"; continue
+    fi
+    # mv -n : jamais d ecrasement ; si la cible est apparue entre-temps (synchro du Drive), suffixe suivant
+    while ! { mv -n -- "$tmp" "$cible" 2>/dev/null && [ ! -e "$tmp" ]; }; do
+        [ -e "$tmp" ] || break
+        n=$((n + 1)); cible="$dir/${nom}_$n.$ext"
+        [ "$n" -gt 99 ] && break
+    done
+    if [ ! -e "$tmp" ] && [ -e "$cible" ]; then
+        # le md5 n entre dans vus.md5 qu apres la cible posee et verifiee
+        [ "$(md5sum < "$cible" | awk '{print $1}')" = "$h" ] || { erreurs=$((erreurs + 1)); jl erreur "$src" "" "$h" "cible differente apres pose"; continue; }
+        PU["$an/${cible##*/}"]=1; echo "$an/${cible##*/}" >> "$PATHS"
+        copies=$((copies + 1)); VU["$h"]=1; echo "$h" >> "$VUS"; jl copie "$src" "${cible#$DEST/}" "$h" "$src_date"
+    else
+        rm -f "$tmp"; erreurs=$((erreurs + 1)); jl erreur "$src" "" "$h" "deplacement vers $cible"
+    fi
+done < "$CACHE_DIR/liste.tmp"
+
+# ---- demontage puis resume ----------------------------------------------------------------------
+nettoyer; demonte=$?
+trap - EXIT
+resume="Photos iPhone terminé.
+Copiées : $copies
+Déjà dans le Drive (sautées) : $sautes
+Erreurs : $erreurs"
+[ "$sans_exif" -gt 0 ] && resume="$resume
+(dont $sans_exif sans date de prise lisible : date du fichier utilisée)"
+[ "$demonte" -ne 0 ] && resume="$resume
+Attention : l'iPhone n'a pas pu être démonté proprement, attends avant de le débrancher."
+resume="$resume
+Les photos partiront dans le Drive à la prochaine synchronisation. [$drive_note]"
+if [ "$erreurs" -gt 0 ]; then fin_msg error "$resume"; exit 2; else fin_msg info "$resume"; fi
+exit 0

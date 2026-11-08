@@ -31,6 +31,7 @@ the T1 link. Scripts and small patches only; [t1bridge](https://github.com/stand
 | Wi-Fi 2.4 GHz and 5 GHz (BCM43602) | Works | needs the NVRAM file with your MAC and the `swctrlmap_2g` line that `install.sh` sets; **requires a reboot after install**; both bands connect in the same boot (3 rounds, and it holds after a reboot) |
 | Keyboard, trackpad, battery, SMC, NVMe | Works | |
 | Power button = Touch ID sensor | Handled | logind ignores the key |
+| Copy photos from an iPhone over USB | Works (one run) | `scripts/photos-iphone`, see below; 4154 files seen, 2643 copied, 0 errors, on the tested machine |
 | Sleep / resume | **Known issue**, being tested | after a wake-up the 5 GHz band is lost until a reboot. Setting `d3cold_allowed=0` on the PCIe bridges prevents the wake-up: **do not do it** (only the NVMe rule is applied) |
 | Sound (CS8409), camera outside Howdy | Not tested | |
 
@@ -69,6 +70,42 @@ What it sets up:
    in two places (t1bridge `identities.meta`, and the libfprint `FP3` print). The script
    edits both after a backup and restores it if its final check fails. It was run once by hand;
    the parametrised version in this repository was not re-run as is.
+
+## Copy photos from an iPhone (USB)
+
+`scripts/photos-iphone` copies the photos and videos of an iPhone into a folder, one click, no service and no udev rule
+of its own. It mounts the phone with `ifuse` (usbmuxd, libimobiledevice), reads `DCIM`, and for each file:
+
+- computes its md5 and **skips** it when that md5 is already known (the md5 list of your cloud folder read with
+  `rclone md5sum`, plus a local cache updated on every run), so nothing is stored twice;
+- names the copy `YYYY/YYYYMMDD_HHMMSS.ext` from the date taken (EXIF `DateTimeOriginal`; for a video, the QuickTime
+  creation date), keeps `.heic` and `.mov` as they are, and adds `_1`, `_2` when a name is already taken on the disk **or**
+  in the cloud folder with different content (it never overwrites);
+- never deletes anything from the phone, always unmounts (also on Cancel), and shows a progress bar
+  (pairing, mount, cloud list, reading, N of total) and a summary (copied, skipped, errors).
+
+Install (Debian 13):
+
+```sh
+sudo apt install $(grep -v '^#' conf/photos-iphone.packages)
+sudo install -m 755 scripts/photos-iphone /usr/local/bin/photos-iphone
+sudo install -m 644 conf/photos-iphone.desktop /usr/share/applications/photos-iphone.desktop
+```
+
+Then start **Photos iPhone** from the application menu. The first time, unlock the phone and tap **Trust** when it asks
+"Trust this computer?". Settings, optional, in `~/.config/photos-iphone.conf` (shell syntax):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PI_DEST` | `~/google/Foto/camera` | destination folder; the year folders go inside |
+| `PI_RCLONE_REMOTE` | empty | rclone remote and folder holding your photos, e.g. `mydrive:Foto/camera`; empty = only the local cache |
+
+On a T1 MacBook, Debian's `usbmuxd` udev rule (`39-usbmuxd.rules`) also matches the iBridge (`05ac:8600`) and puts it in
+USB configuration 0, which removes the Touch Bar and camera interfaces (measured on the tested machine). Keep a copy of the rule in
+`/etc/udev/rules.d/` without the iBridge product, so the phones still use usbmuxd and the Touch Bar is left alone.
+
+Status: run once on the tested MacBookPro13,2 against one iPhone (4154 files seen, 2643 copied, 1511 skipped, 0 errors); Cancel,
+name collisions and the progress bar were rehearsed on fake data. The messages of the tool are in French.
 
 ## Notes
 

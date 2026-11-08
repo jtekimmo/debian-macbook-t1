@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Photos iPhone
+Comment=Copier les photos de l'iPhone dans le Drive
+Exec=/usr/local/bin/photos-iphone
+Icon=camera-photo
+Terminal=false
+Categories=Graphics;
