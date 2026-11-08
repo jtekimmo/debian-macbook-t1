@@ -1,0 +1,873 @@
+diff --git a/build.rs b/build.rs
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,6 @@
++// Module linked NODELETE. libpam calls dlclose at pam_end; a thread
++// of a losing sub-stack that overran the wait bound would otherwise run
++// unloaded code.
++fn main() {
++    println!("cargo:rustc-cdylib-link-arg=-Wl,-z,nodelete");
++}
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -27,6 +27,7 @@
+ name = "pam-any"
+ version = "0.1.0"
+ dependencies = [
++ "libc",
+  "pam-bindings",
+  "pam-client2",
+  "serde",
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -12,3 +12,4 @@
+ serde = { version = "1.0.197", features = ["derive"] }
+ serde_json = "1.0.114"
+ pam-client2 = { version = "0.5.5", default-features = false }
++libc = "0.2.153"
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,20 +1,51 @@
++// pam-any, base c239b82 (upstream PR #17) + fix:
++// - the application's conversation is only called by the thread that received
++//   pam_sm_authenticate (as in #17);
++// - on a terminal (PAM_TTY = standard input), the password prompt
++//   is read by the module and withdrawn as soon as another method succeeds;
++// - before returning, every losing sub-stack is stopped (prompt
++//   refused, SIGINT blocked to its thread for pam_fprintd, SIGTERM then SIGKILL
++//   to the processes it started, e.g. howdy's compare.py) and its thread joined;
++// - the module is linked NODELETE (build.rs): a thread overrunning the wait bound
++//   cannot run unloaded code;
++// - option "retry_secs" (0 = off): the face sub-stack
++//   (name ending in "howdy") is silently relaunched during this time
++//   ("Failure, ..." and "Skipped ..." are never passed to the application) as long as
++//   no other method has won; lid closed: no retry;
++//   the retry only applies to the services of "retry_services" (lightdm,
++//   xfce4-screensaver); the face sub-stack never passes "Failure"
++//   or "Skipped", whatever the service.
+ use std::collections::HashMap;
+ use std::ffi::{CStr, CString};
++use std::fs::{File, OpenOptions};
++use std::io::{ErrorKind, Read, Write};
++use std::os::fd::AsRawFd;
++use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
++use std::os::unix::net::UnixStream;
++use std::os::unix::thread::JoinHandleExt;
+ use std::sync::Arc;
+-use std::sync::mpsc::{Receiver, Sender, SyncSender};
+-use std::thread::{self, Thread};
++use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
++use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
++use std::thread::{self, JoinHandle};
++use std::time::{Duration, Instant};
+ 
+-use pam_bindings::constants::PamResultCode::{PAM_AUTH_ERR, PAM_SUCCESS};
++use pam_bindings::constants::PamResultCode::{PAM_AUTH_ERR, PAM_CONV_ERR, PAM_SUCCESS};
+ use pam_bindings::constants::{
+     PAM_ERROR_MSG, PAM_PROMPT_ECHO_OFF, PAM_RADIO_TYPE, PAM_TEXT_INFO, PamFlag, PamMessageStyle,
+     PamResultCode,
+ };
+ use pam_bindings::conv::Conv;
++use pam_bindings::items::{Service, Tty};
+ use pam_bindings::module::{PamHandle, PamHooks};
+ use pam_bindings::pam_try;
+ use pam_client2::{Context, ConversationHandler, ErrorCode, Flag};
+ use serde::{Deserialize, Serialize};
+ 
++/// Delay after which the processes of a losing sub-stack receive SIGKILL.
++const KILL_AFTER: Duration = Duration::from_secs(2);
++/// Wait bound for losing threads; beyond it they are detached (NODELETE module).
++const JOIN_LIMIT: Duration = Duration::from_secs(5);
++
+ #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+ pub enum Mode {
+     One,
+@@ -25,6 +56,26 @@
+ struct Input {
+     mode: Mode,
+     modules: HashMap<String, String>,
++    /// true: without a terminal (lock screen, LightDM), a password prompt
++    /// from a sub-stack is refused instead of being put to the application,
++    /// because a graphical prompt cannot be withdrawn.
++    #[serde(default)]
++    prompt_needs_tty: bool,
++    /// Time (s) during which the face sub-stack is silently relaunched.
++    #[serde(default)]
++    retry_secs: u64,
++    /// Services (PAM_SERVICE, comma separated: a bracket would be eaten by PAM) for which the retry applies; the others (sudo, su, polkit...)
++    /// make a single face attempt, the password being typeable at once.
++    #[serde(default)]
++    retry_services: String,
++}
++
++/// Lid closed (ACPI): nothing to retry, the password comes at once.
++fn lid_closed() -> bool {
++    let Ok(dir) = std::fs::read_dir("/proc/acpi/button/lid") else { return false };
++    dir.flatten().any(|e| {
++        std::fs::read_to_string(e.path().join("state")).map(|t| t.contains("closed")).unwrap_or(false)
++    })
+ }
+ 
+ enum MsgType {
+@@ -43,6 +94,7 @@
+     _type: MsgType,
+     msg: String,
+ }
++#[derive(PartialEq)]
+ enum PromptType {
+     EchoOff,
+     YesNo,
+@@ -60,119 +112,552 @@
+     str: String,
+ }
+ 
++/// Wake-up of the main thread: one byte on a non-blocking socket pair.
++/// send(MSG_NOSIGNAL): never a SIGPIPE in the application if the read side is closed.
++struct Waker(UnixStream);
++impl Waker {
++    fn wake(&self) {
++        let b = [1u8];
++        // SAFETY: fd valid while self lives; 1-byte buffer valid.
++        unsafe {
++            libc::send(
++                self.0.as_raw_fd(),
++                b.as_ptr().cast(),
++                1,
++                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
++            );
++        }
++    }
++}
++
++fn drain(wake_r: &UnixStream) {
++    let mut buf = [0u8; 64];
++    loop {
++        match (&*wake_r).read(&mut buf) {
++            Ok(0) => break,
++            Ok(_) => continue,
++            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
++            Err(_) => break,
++        }
++    }
++}
++
++/// poll on the wake-up and, if needed, the terminal; returns (wake-up ready, terminal ready).
++fn wait(wake_r: &UnixStream, tty: Option<&File>, timeout_ms: i32) -> (bool, bool) {
++    let mut fds = [
++        libc::pollfd { fd: wake_r.as_raw_fd(), events: libc::POLLIN, revents: 0 },
++        libc::pollfd { fd: tty.map(|t| t.as_raw_fd()).unwrap_or(-1), events: libc::POLLIN, revents: 0 },
++    ];
++    // SAFETY: valid array of 2 pollfd; fd -1 is ignored by poll.
++    let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
++    if r <= 0 {
++        return (false, false);
++    }
++    (fds[0].revents != 0, fds[1].revents != 0)
++}
++
++fn gettid() -> i32 {
++    // SAFETY: system call without argument.
++    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
++}
++
++/// Blocks SIGINT in the current thread only: a SIGINT sent to this thread by
++/// pthread_kill stays pending and pam_fprintd reads it through its signalfd
++/// (do_verify: "Received signal 2 during verify", returns PAM_AUTHINFO_UNAVAIL).
++fn block_sigint_in_this_thread() {
++    // SAFETY: local sigset_t initialised by sigemptyset.
++    unsafe {
++        let mut set: libc::sigset_t = std::mem::zeroed();
++        libc::sigemptyset(&mut set);
++        libc::sigaddset(&mut set, libc::SIGINT);
++        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
++    }
++}
++
++/// Terminal on which the application authenticates: PAM_TTY must name a
++/// character device that is also standard input (sudo, su, login,
++/// pamtester -I tty=...). Excludes PAM_TTY=":0" (LightDM, xfce4-screensaver)
++/// and sudo -S (standard input is a pipe).
++fn open_auth_tty(pamh: &PamHandle) -> Option<File> {
++    let item = pamh.get_item::<Tty>().ok()??;
++    let name = item.0.to_str().ok()?;
++    if name.is_empty() {
++        return None;
++    }
++    let path = if name.starts_with('/') { name.to_string() } else { format!("/dev/{name}") };
++    let meta = std::fs::metadata(&path).ok()?;
++    if !meta.file_type().is_char_device() {
++        return None;
++    }
++    let stdin = std::fs::metadata("/proc/self/fd/0").ok()?;
++    if !stdin.file_type().is_char_device() || stdin.rdev() != meta.rdev() {
++        return None;
++    }
++    let file = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
++        .open(&path)
++        .ok()?;
++    // SAFETY: valid fd.
++    if unsafe { libc::isatty(file.as_raw_fd()) } != 1 {
++        return None;
++    }
++    Some(file)
++}
++
++/// Password prompt read by the module on the terminal, withdrawable.
++struct TtyPrompt<'a> {
++    tty: &'a File,
++    worker: usize,
++    text: String,
++    buf: Vec<u8>,
++    orig: libc::termios,
++}
++
++enum TtyEvent {
++    Pending,
++    Answer(CString),
++    Abort,
++}
++
++impl<'a> TtyPrompt<'a> {
++    fn start(tty: &'a File, worker: usize, text: String) -> Option<Self> {
++        let fd = tty.as_raw_fd();
++        // SAFETY: local termios filled by tcgetattr.
++        let orig = unsafe {
++            let mut t: libc::termios = std::mem::zeroed();
++            if libc::tcgetattr(fd, &mut t) != 0 {
++                return None;
++            }
++            t
++        };
++        let mut raw = orig;
++        // No echo, no canonical line, no signals: Ctrl-C is read as a byte.
++        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
++        raw.c_cc[libc::VMIN] = 1;
++        raw.c_cc[libc::VTIME] = 0;
++        // TCSAFLUSH like sudo (tgetpass): typed-ahead input is dropped.
++        // SAFETY: valid fd and termios.
++        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
++            return None;
++        }
++        let p = TtyPrompt { tty, worker, text, buf: Vec::new(), orig };
++        p.show();
++        Some(p)
++    }
++
++    fn show(&self) {
++        let _ = (&*self.tty).write_all(self.text.as_bytes());
++    }
++
++    /// Reads what is available without blocking (VMIN=1 but poll said ready).
++    fn read(&mut self) -> TtyEvent {
++        let mut b = [0u8; 1];
++        match (&*self.tty).read(&mut b) {
++            Ok(0) => return TtyEvent::Abort,
++            Ok(_) => {}
++            Err(e) if e.kind() == ErrorKind::Interrupted => return TtyEvent::Pending,
++            Err(_) => return TtyEvent::Abort,
++        }
++        match b[0] {
++            b'\n' | b'\r' => {
++                let _ = (&*self.tty).write_all(b"\n");
++                let pw = std::mem::take(&mut self.buf);
++                match CString::new(pw) {
++                    Ok(c) => TtyEvent::Answer(c),
++                    Err(_) => TtyEvent::Abort,
++                }
++            }
++            0x7f | 0x08 => {
++                self.buf.pop();
++                TtyEvent::Pending
++            }
++            0x15 => {
++                self.buf.clear();
++                TtyEvent::Pending
++            }
++            0x03 | 0x04 => {
++                let _ = (&*self.tty).write_all(b"\n");
++                TtyEvent::Abort
++            }
++            c => {
++                self.buf.push(c);
++                TtyEvent::Pending
++            }
++        }
++    }
++
++    /// Withdrawal: another method won; the prompt line is erased.
++    fn withdraw(self) {
++        let _ = (&*self.tty).write_all(b"\r\x1b[2K");
++        // Drop restores the terminal and drops unread input.
++    }
++}
++
++impl Drop for TtyPrompt<'_> {
++    fn drop(&mut self) {
++        for b in self.buf.iter_mut() {
++            *b = 0;
++        }
++        // TCSAFLUSH: a typed but unread password remainder does not reach the shell.
++        // SAFETY: valid fd and original termios.
++        unsafe {
++            libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSAFLUSH, &self.orig);
++        }
++    }
++}
++
++struct Worker {
++    req_rx: Option<Receiver<Req>>,
++    res_tx: Option<SyncSender<Option<CString>>>,
++    result_rx: Receiver<bool>,
++    tid: Arc<AtomicI32>,
++    handle: Option<JoinHandle<()>>,
++    done: bool,
++    stop: Arc<AtomicBool>,
++}
++
++impl Worker {
++    /// Stops a losing sub-stack: SIGINT to its thread (pam_fprintd), SIGTERM
++    /// or SIGKILL to the processes this thread started (howdy's compare.py,
++    /// pam_exec, unix_chkpwd).
++    fn cancel(&self, hard: bool) {
++        let Some(handle) = &self.handle else { return };
++        // SAFETY: pthread_t valid while the thread is not joined.
++        unsafe {
++            libc::pthread_kill(handle.as_pthread_t(), libc::SIGINT);
++        }
++        let tid = self.tid.load(Ordering::SeqCst);
++        if tid <= 0 {
++            return;
++        }
++        let sig = if hard { libc::SIGKILL } else { libc::SIGTERM };
++        if let Ok(list) = std::fs::read_to_string(format!("/proc/self/task/{tid}/children")) {
++            for pid in list.split_whitespace().filter_map(|p| p.parse::<i32>().ok()) {
++                if pid > 1 {
++                    // SAFETY: pid of a child not yet waited for (zombie at worst),
++                    // hence not reused.
++                    unsafe {
++                        libc::kill(pid, sig);
++                    }
++                }
++            }
++        }
++    }
++}
++
++/// Stops and joins all threads before returning.
++fn finish(workers: &mut [Worker], wake_r: &UnixStream) {
++    for w in workers.iter_mut() {
++        w.stop.store(true, Ordering::SeqCst);
++        // A current or future prompt of a sub-stack receives CONV_ERR.
++        w.res_tx = None;
++        w.req_rx = None;
++    }
++    let start = Instant::now();
++    loop {
++        let mut alive = false;
++        for w in workers.iter_mut() {
++            let finished = match &w.handle {
++                Some(h) => h.is_finished(),
++                None => continue,
++            };
++            if finished {
++                if let Some(h) = w.handle.take() {
++                    let _ = h.join();
++                }
++            } else {
++                alive = true;
++                if !w.done {
++                    w.cancel(start.elapsed() >= KILL_AFTER);
++                }
++            }
++        }
++        if !alive {
++            return;
++        }
++        if start.elapsed() >= JOIN_LIMIT {
++            // Detached thread: it no longer touches the application's conversation
++            // (channels closed) and the module stays loaded (NODELETE).
++            for w in workers.iter_mut() {
++                w.handle.take();
++            }
++            return;
++        }
++        let _ = wait(wake_r, None, 50);
++        drain(wake_r);
++    }
++}
++
+ struct PamAny;
+ pam_bindings::pam_hooks!(PamAny);
+ impl PamHooks for PamAny {
+     fn sm_authenticate(pamh: &mut PamHandle, args: Vec<&CStr>, _flags: PamFlag) -> PamResultCode {
+         let arg_string = args
+             .iter()
+-            .map(|s| s.to_str().unwrap())
++            .map(|s| s.to_str().unwrap_or(""))
+             .collect::<Vec<_>>()
+             .join(" ");
+-        // println!("Input: {}", arg_string);
+         let input = pam_try!(serde_json::from_str::<Input>(&arg_string).map_err(|_e| PAM_AUTH_ERR));
+-        // println!("Input: {:#?}", input);
+ 
+         let conv = pam_try!(pam_try!(pamh.get_item::<Conv>()).ok_or(PAM_AUTH_ERR));
+         let user = Arc::new(pam_try!(pamh.get_user(None)));
+-
+-        let (ref msg_tx, msg_rx) = std::sync::mpsc::channel();
+-        let channels = input
+-            .modules
+-            .into_iter()
+-            .map(|(service, service_display_name)| {
+-                let user = user.clone();
+-                let main_thread = thread::current();
+-                let msg_tx = msg_tx.clone();
+-
+-                let (req_tx, req_rx) = std::sync::mpsc::sync_channel(1);
+-                let (res_tx, res_rx) = std::sync::mpsc::sync_channel(1);
+-                let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+-                thread::spawn(move || {
+-                    let mut context = match Context::new(
+-                        &service,
+-                        Some(&user),
+-                        PamAnyConversationHandler {
+-                            service_display_name: &service_display_name,
+-                            main_thread: &main_thread,
+-                            msg_tx: msg_tx.clone(),
+-                            req_tx: req_tx.clone(),
+-                            res_rx,
+-                            username: &user,
+-                        },
+-                    ) {
+-                        Ok(context) => context,
+-                        Err(e) => {
+-                            let _ = result_tx.send(Err(e));
+-                            main_thread.unpark();
+-                            return;
+-                        }
+-                    };
+-                    let result = context.authenticate(Flag::empty());
+-                    let _ = result_tx.send(result);
+-                    main_thread.unpark();
+-                });
+-                (req_rx, res_tx, result_rx)
+-            })
+-            .collect::<Box<[_]>>();
+-        // If mode is One we count fails to know if all failed
+-        // If mode is All we count successes to know if all succeeded
+-        let mut count = 0;
+-        loop {
+-            let mut nothing_to_process = true;
+-
+-            // Print any messages first
+-            while let Ok(msg) = msg_rx.try_recv() {
+-                nothing_to_process = false;
+-                pam_try!(conv.send(msg._type.style(), &msg.msg));
+-            }
+-
+-            // Process results
+-            for result in channels
+-                .iter()
+-                .filter_map(|(_, _, result_rx)| result_rx.try_recv().ok())
+-            {
+-                nothing_to_process = false;
+-                match input.mode {
+-                    Mode::One => {
+-                        if result.is_ok() {
+-                            return PAM_SUCCESS;
+-                        } else {
+-                            count += 1;
+-                            if count == channels.len() {
+-                                return PAM_AUTH_ERR;
++        let tty = open_auth_tty(pamh);
++        let pam_service = pamh
++            .get_item::<Service>()
++            .ok()
++            .flatten()
++            .and_then(|s| s.0.to_str().ok().map(String::from))
++            .unwrap_or_default();
++        let retry_here = input.retry_services.split(',').any(|x| x.trim() == pam_service);
++
++        let (wake_r, wake_w) = pam_try!(UnixStream::pair().map_err(|_| PAM_AUTH_ERR));
++        pam_try!(wake_r.set_nonblocking(true).map_err(|_| PAM_AUTH_ERR));
++        pam_try!(wake_w.set_nonblocking(true).map_err(|_| PAM_AUTH_ERR));
++
++        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
++        let mut workers: Vec<Worker> = Vec::new();
++        for (service, service_display_name) in input.modules.iter() {
++            let service = service.clone();
++            let service_display_name = service_display_name.clone();
++            let user = user.clone();
++            let msg_tx = msg_tx.clone();
++            let Ok(w) = wake_w.try_clone() else { continue };
++            let waker = Arc::new(Waker(w));
++            let tid = Arc::new(AtomicI32::new(0));
++            let tid_w = tid.clone();
++            let stop = Arc::new(AtomicBool::new(false));
++            let stop_w = stop.clone();
++            let is_face = service.ends_with("howdy");
++            let retry_secs = if is_face && retry_here { input.retry_secs } else { 0 };
++
++            let (req_tx, req_rx) = std::sync::mpsc::sync_channel(1);
++            let (res_tx, res_rx) = std::sync::mpsc::sync_channel(1);
++            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
++            let spawned = thread::Builder::new().name("pam-any".into()).spawn(move || {
++                block_sigint_in_this_thread();
++                tid_w.store(gettid(), Ordering::SeqCst);
++                let ok = match Context::new(
++                    &service,
++                    Some(&user),
++                    PamAnyConversationHandler {
++                        service_display_name: &service_display_name,
++                        waker: waker.clone(),
++                        msg_tx,
++                        req_tx,
++                        res_rx,
++                        username: &user,
++                        quiet: is_face,
++                    },
++                ) {
++                    // pam_end of the sub-stack (drop) before the result is sent.
++                    Ok(mut context) => {
++                        let deadline = Instant::now() + Duration::from_secs(retry_secs);
++                        loop {
++                            let started = Instant::now();
++                            let ok = context.authenticate(Flag::empty()).is_ok();
++                            if ok
++                                || retry_secs == 0
++                                || stop_w.load(Ordering::SeqCst)
++                                || Instant::now() >= deadline
++                                || lid_closed()
++                                // Failure in under a second (SSH, camera absent, lid closed):
++                                // no camera read took place, nothing to retry.
++                                || started.elapsed() < Duration::from_secs(1)
++                            {
++                                break ok;
+                             }
+                         }
+                     }
+-                    Mode::All => {
+-                        if result.is_ok() {
+-                            count += 1;
+-                            if count == channels.len() {
+-                                return PAM_SUCCESS;
+-                            }
+-                        } else {
+-                            return PAM_AUTH_ERR;
+-                        }
++                    Err(_) => false,
++                };
++                let _ = result_tx.send(ok);
++                waker.wake();
++            });
++            let handle = match spawned {
++                Ok(h) => Some(h),
++                Err(_) => None,
++            };
++            workers.push(Worker {
++                req_rx: Some(req_rx),
++                res_tx: Some(res_tx),
++                result_rx,
++                tid,
++                handle,
++                done: false,
++                stop,
++            });
++        }
++        drop(msg_tx);
++        drop(wake_w);
++
++        let code = run(
++            &conv,
++            input.mode,
++            input.prompt_needs_tty,
++            &mut workers,
++            &msg_rx,
++            &wake_r,
++            tty.as_ref(),
++        );
++        finish(&mut workers, &wake_r);
++        code
++    }
++}
++
++fn run(
++    conv: &Conv,
++    mode: Mode,
++    prompt_needs_tty: bool,
++    workers: &mut [Worker],
++    msg_rx: &Receiver<Msg>,
++    wake_r: &UnixStream,
++    tty: Option<&File>,
++) -> PamResultCode {
++    let total = workers.len();
++    if total == 0 {
++        return PAM_AUTH_ERR;
++    }
++    // If mode is One we count fails to know if all failed
++    // If mode is All we count successes to know if all succeeded
++    let mut count = 0;
++    let mut prompt: Option<TtyPrompt> = None;
++    let mut conv_failed = false;
++    // Reply to hand to a sub-stack: handed over only after a new
++    // pass over the results, so that a password typed when another
++    // method has already won is not verified (pam_unix: 2 s failure delay).
++    let mut deliver: Option<(usize, Option<CString>)> = None;
++    loop {
++        let mut progressed = false;
++
++        // Results first: a success does not wait for messages.
++        for i in 0..total {
++            let w = &mut workers[i];
++            if w.done {
++                continue;
++            }
++            let ok = match w.result_rx.try_recv() {
++                Ok(ok) => ok,
++                Err(TryRecvError::Empty) => continue,
++                // Thread dead without result (or never started): the method fails.
++                Err(TryRecvError::Disconnected) => false,
++            };
++            w.done = true;
++            progressed = true;
++            if prompt.as_ref().is_some_and(|p| p.worker == i) {
++                prompt.take().map(TtyPrompt::withdraw);
++            }
++            match mode {
++                Mode::One => {
++                    if ok {
++                        prompt.take().map(TtyPrompt::withdraw);
++                        return PAM_SUCCESS;
++                    }
++                    count += 1;
++                    if count == total {
++                        return PAM_AUTH_ERR;
++                    }
++                }
++                Mode::All => {
++                    if !ok {
++                        prompt.take().map(TtyPrompt::withdraw);
++                        return PAM_AUTH_ERR;
++                    }
++                    count += 1;
++                    if count == total {
++                        return PAM_SUCCESS;
+                     }
+                 }
+             }
++        }
++        // The application refused a prompt (dialog closed, input closed) and
++        // no method succeeded in the meantime: give up, as in #17.
++        if conv_failed {
++            return PAM_CONV_ERR;
++        }
++        if let Some((i, resp)) = deliver.take() {
++            progressed = true;
++            if let Some(tx) = &workers[i].res_tx {
++                let _ = tx.send(resp);
++            }
++        }
+ 
+-            // Handle prompts, prioritizing the prompts in order of services as they're listed in the input
+-            if let Some((req, res_tx)) = channels.iter().find_map(|(req_rx, res_tx, _)| {
+-                if let Ok(req) = req_rx.try_recv() {
+-                    nothing_to_process = false;
+-                    Some((req, res_tx))
++        // Messages from the sub-stacks (display error ignored).
++        while let Ok(msg) = msg_rx.try_recv() {
++            progressed = true;
++            if prompt.is_some() {
++                if let Some(t) = tty {
++                    let _ = (&*t).write_all(b"\r\x1b[2K");
++                }
++            }
++            let _ = conv.send(msg._type.style(), &msg.msg);
++            if let Some(p) = &prompt {
++                p.show();
++            }
++        }
++
++        // Prompts from the sub-stacks.
++        if prompt.is_none() {
++            let found = workers.iter().enumerate().find_map(|(i, w)| {
++                if w.done {
++                    return None;
++                }
++                w.req_rx.as_ref()?.try_recv().ok().map(|r| (i, r))
++            });
++            if let Some((i, req)) = found {
++                progressed = true;
++                let mut answer_now = |resp: Option<CString>| deliver = Some((i, resp));
++                if req._type == PromptType::EchoOff && tty.is_some() {
++                    match TtyPrompt::start(tty.unwrap(), i, req.str.clone()) {
++                        Some(p) => prompt = Some(p),
++                        None => match conv.send(req._type.style(), &req.str) {
++                            Ok(r) => answer_now(r),
++                            Err(_) => {
++                                answer_now(None);
++                                conv_failed = true;
++                            }
++                        },
++                    }
++                } else if req._type == PromptType::EchoOff && prompt_needs_tty {
++                    // No terminal: password method unavailable here.
++                    answer_now(None);
+                 } else {
+-                    None
++                    // Without a terminal the application's prompt is blocking:
++                    // a success during that time is taken on its return.
++                    match conv.send(req._type.style(), &req.str) {
++                        Ok(r) => answer_now(r),
++                        Err(_) => {
++                            answer_now(None);
++                            conv_failed = true;
++                        }
++                    }
+                 }
+-            }) {
+-                let response = pam_try!(conv.send(req._type.style(), &req.str));
+-                let _ = res_tx.send(response);
+             }
++        }
+ 
+-            if nothing_to_process {
+-                // Wait until there is something to process (this (main) thread will be unparked by another thread)
+-                thread::park();
++        if progressed {
++            continue;
++        }
++        let (wake_ready, tty_ready) = wait(wake_r, prompt.as_ref().map(|p| p.tty), -1);
++        if wake_ready {
++            drain(wake_r);
++        }
++        if tty_ready {
++            if let Some(p) = prompt.as_mut() {
++                match p.read() {
++                    TtyEvent::Pending => {}
++                    TtyEvent::Answer(pw) => {
++                        let i = p.worker;
++                        prompt = None; // restore the terminal
++                        deliver = Some((i, Some(pw)));
++                    }
++                    TtyEvent::Abort => {
++                        // Ctrl-C, Ctrl-D or end of the terminal: all of pam-any stops.
++                        drop(prompt.take());
++                        return PAM_AUTH_ERR;
++                    }
++                }
+             }
+         }
+     }
+@@ -181,16 +666,37 @@
+ struct PamAnyConversationHandler<'a> {
+     service_display_name: &'a str,
+     username: &'a str,
+-    main_thread: &'a Thread,
++    /// true: "Failure, ..." and "Skipped ..." of the face sub-stack are not passed on.
++    quiet: bool,
++    waker: Arc<Waker>,
+     msg_tx: Sender<Msg>,
+     req_tx: SyncSender<Req>,
+     res_rx: Receiver<Option<CString>>,
+ }
+ 
+ impl PamAnyConversationHandler<'_> {
++    fn muet(&self, msg: &str) -> bool {
++        self.quiet && (msg.starts_with("Failure") || msg.starts_with("Skipped"))
++    }
++
+     fn format_msg(&self, msg: &str) -> String {
+         format!("[{}] {}", self.service_display_name, msg)
+     }
++
++    fn ask(&mut self, _type: PromptType, prompt: &CStr) -> Result<CString, ErrorCode> {
++        let prompt = prompt.to_str().map_err(|_| ErrorCode::CONV_ERR)?;
++        self.req_tx
++            .send(Req {
++                _type,
++                str: self.format_msg(prompt),
++            })
++            .map_err(|_| ErrorCode::CONV_ERR)?;
++        self.waker.wake();
++        self.res_rx
++            .recv()
++            .map_err(|_| ErrorCode::CONV_ERR)?
++            .ok_or(ErrorCode::CONV_ERR)
++    }
+ }
+ 
+ impl<'a> ConversationHandler for PamAnyConversationHandler<'a> {
+@@ -205,36 +711,11 @@
+         &mut self,
+         prompt: &CStr,
+     ) -> Result<std::ffi::CString, pam_client2::ErrorCode> {
+-        let prompt = prompt.to_str().map_err(|_| ErrorCode::CONV_ERR)?;
+-        self.req_tx
+-            .send(Req {
+-                _type: PromptType::EchoOff,
+-                str: self.format_msg(prompt),
+-            })
+-            .map_err(|_| ErrorCode::CONV_ERR)?;
+-        self.main_thread.unpark();
+-        let res = self
+-            .res_rx
+-            .recv()
+-            .map_err(|_| ErrorCode::CONV_ERR)?
+-            .ok_or(ErrorCode::CONV_ERR)?;
+-        Ok(res)
++        self.ask(PromptType::EchoOff, prompt)
+     }
+ 
+     fn radio_prompt(&mut self, prompt: &CStr) -> Result<bool, ErrorCode> {
+-        let prompt = prompt.to_str().map_err(|_| ErrorCode::CONV_ERR)?;
+-        self.req_tx
+-            .send(Req {
+-                _type: PromptType::YesNo,
+-                str: self.format_msg(prompt),
+-            })
+-            .map_err(|_| ErrorCode::CONV_ERR)?;
+-        self.main_thread.unpark();
+-        let res = self
+-            .res_rx
+-            .recv()
+-            .map_err(|_| ErrorCode::CONV_ERR)?
+-            .ok_or(ErrorCode::CONV_ERR)?;
++        let res = self.ask(PromptType::YesNo, prompt)?;
+         // This string to bool logic is copied from the default impl
+         let res = matches!(res.as_bytes_with_nul()[0], b'Y' | b'y' | b'j' | b'J');
+         Ok(res)
+@@ -242,21 +723,27 @@
+ 
+     fn text_info(&mut self, msg: &CStr) {
+         if let Ok(msg) = msg.to_str() {
++            if self.muet(msg) {
++                return;
++            }
+             let _ = self.msg_tx.send(Msg {
+                 _type: MsgType::Info,
+                 msg: self.format_msg(msg),
+             });
+-            self.main_thread.unpark();
++            self.waker.wake();
+         }
+     }
+ 
+     fn error_msg(&mut self, msg: &CStr) {
+         if let Ok(msg) = msg.to_str() {
++            if self.muet(msg) {
++                return;
++            }
+             let _ = self.msg_tx.send(Msg {
+                 _type: MsgType::Error,
+                 msg: self.format_msg(msg),
+             });
+-            self.main_thread.unpark();
++            self.waker.wake();
+         }
+     }
+ }

@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Sub-stack of libpam_any.so, fingerprint only (10 s, 3 tries); called by the pam-any profile, never directly.
+auth	required	pam_fprintd.so max-tries=3 timeout=10
+account	include		common-account

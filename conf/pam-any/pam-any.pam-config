@@ -1,0 +1,7 @@
+Name: Face, fingerprint and password at the same time (pam-any)
+Default: no
+Priority: 300
+Conflicts: howdy, fprintd
+Auth-Type: Primary
+Auth:
+	[success=end default=ignore]	libpam_any.so { "mode": "One", "modules": { "pam-any-howdy": "Face", "pam-any-fprintd": "Fingerprint", "pam-any-unix": "Password" }, "prompt_needs_tty": true, "retry_secs": 30, "retry_services": "lightdm" }

@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Sub-stack of libpam_any.so, password only; used only on a terminal (sudo, su), refused without a terminal
+# (option prompt_needs_tty of the pam-any profile); called by the pam-any profile, never directly.
+auth	required	pam_unix.so nullok
+account	include		common-account

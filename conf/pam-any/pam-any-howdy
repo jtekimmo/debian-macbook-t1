@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Sub-stack of libpam_any.so, face only; called by the pam-any profile, never directly.
+# Adjust the path of pam_howdy.so to where Howdy is installed on your system.
+auth	required	/usr/local/lib/x86_64-linux-gnu/security/pam_howdy.so
+account	include		common-account

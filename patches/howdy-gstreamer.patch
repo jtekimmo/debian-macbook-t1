@@ -16,7 +16,16 @@
  	def _create_reader(self):
  		"""
  		Sets up the video reader instance
-@@ -124,6 +133,16 @@
+@@ -120,10 +129,29 @@
+ 
+ 		else:
+ 			# Start video capture on the IR camera through OpenCV
++			# OpenCV logs the failing V4L2 attempt and the GStreamer stream opening as WARNING (no position);
++			# ERROR level while opening, restored afterwards (cv2 is already imported by compare.py: OPENCV_LOG_LEVEL would be too late)
++			niveau_cv2 = cv2.getLogLevel() if hasattr(cv2, "setLogLevel") else None
++			if niveau_cv2 is not None:
++				cv2.setLogLevel(2)
+ 			self.internal = cv2.VideoCapture(
  				self.config.get("video", "device_path"),
  				cv2.CAP_V4L
  			)
@@ -29,7 +38,11 @@
 +					" ! appsink drop=true max-buffers=1 sync=false",
 +					cv2.CAP_GSTREAMER
 +				)
++				if niveau_cv2 is not None:
++					cv2.setLogLevel(niveau_cv2)
 +				return
++			if niveau_cv2 is not None:
++				cv2.setLogLevel(niveau_cv2)
  			# Set the capture frame rate
  			# Without this the first detected (and possibly lower) frame rate is used, -1 seems to select the highest
  			# Use 0 as a fallback to avoid breaking an existing setup, new installs should default to -1

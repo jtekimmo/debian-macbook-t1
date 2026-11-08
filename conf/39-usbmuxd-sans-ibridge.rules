@@ -1,0 +1,17 @@
+# Copy of /lib/udev/rules.d/39-usbmuxd.rules (usbmuxd 1.1.1-6+deb13u1) WITHOUT the Apple iBridge (05ac:8600): the original rule puts
+# the T1 iBridge in USB configuration 0 when it is added, so the Touch Bar and the FaceTime camera lose their interfaces
+# (the apple-ibridge drivers need configuration 1; measured on the tested machine). iPhones (5ac/12[9a]x) keep usbmuxd.
+# Back out: delete this file.
+# usbmuxd (Apple Mobile Device Muxer listening on /var/run/usbmuxd)
+
+# systemd should receive all events relating to device
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="5ac/12[9a][0-9a-f]/*", TAG+="systemd"
+
+# Initialize iOS devices into "deactivated" USB configuration state and activate usbmuxd
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="5ac/12[9a][0-9a-f]/*", ACTION=="add", ENV{USBMUX_SUPPORTED}="1", ATTR{bConfigurationValue}="0", OWNER="usbmux", ENV{SYSTEMD_WANTS}="usbmuxd.service"
+
+# Make sure properties don't get lost when bind action is called
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="5ac/12[9a][0-9a-f]/*", ACTION=="bind", ENV{USBMUX_SUPPORTED}="1", OWNER="usbmux", ENV{SYSTEMD_WANTS}="usbmuxd.service"
+
+# Exit usbmuxd when the last device is removed
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="5ac/12[9a][0-9a-f]/*", ACTION=="remove", RUN+="/usr/sbin/usbmuxd -x"

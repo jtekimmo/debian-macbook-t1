@@ -1,0 +1,112 @@
+diff --git a/crates/t1-daemons/src/auth_daemon.rs b/crates/t1-daemons/src/auth_daemon.rs
+index 01df45c..df31d66 100644
+--- a/crates/t1-daemons/src/auth_daemon.rs
++++ b/crates/t1-daemons/src/auth_daemon.rs
+@@ -61,6 +61,7 @@ pub enum AuthDaemonError {
+     Scheduler,
+     WorkerLost,
+     Shutdown,
++    LeaseFailed,
+ }
+ 
+ impl fmt::Display for AuthDaemonError {
+@@ -72,6 +73,7 @@ impl fmt::Display for AuthDaemonError {
+             Self::Scheduler => "authentication broker authority became uncertain",
+             Self::WorkerLost => "authentication broker worker was lost",
+             Self::Shutdown => "authentication broker shutdown did not complete",
++            Self::LeaseFailed => "authentication broker SEP lease failed",
+         })
+     }
+ }
+@@ -396,6 +398,11 @@ struct EventLoopContext<'a> {
+     lifecycle: &'a ServiceLifecycle,
+ }
+ 
++/// A failed SEP lease ends the broker once nothing is running and no connection or reply is pending.
++const fn lease_failure_exit(lease_failed: bool, no_active_run: bool, nothing_pending: bool) -> bool {
++    lease_failed && no_active_run && nothing_pending
++}
++
+ #[allow(clippy::too_many_lines)]
+ fn run_event_loop(
+     context: EventLoopContext<'_>,
+@@ -492,6 +499,15 @@ fn run_event_loop(
+             }
+             LifecycleDecision::Terminate => return Err(AuthDaemonError::Scheduler),
+         }
++        // sep-lease != 0 (sep.rs:179-183): exit with a failure as soon as nothing is running, without waiting for the 30 s
++        // idle timeout above: the next fprintd attempt (socket activation) or Restart=on-failure gets a fresh broker.
++        if lease_failure_exit(
++            t1_platform::diagnostics::sep_lease_failed(),
++            active.is_none(),
++            connections.is_empty() && standard_connections.is_empty() && replies.is_empty(),
++        ) {
++            return Err(AuthDaemonError::LeaseFailed);
++        }
+ 
+         flush_standard_replies(&mut standard_connections, now);
+         flush_active_standard_reply(&mut active, service, now)?;
+@@ -968,6 +984,14 @@ fn map_socket_error(_: BrokerSocketError) -> AuthDaemonError {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn failed_sep_lease_ends_the_broker_only_when_idle() {
++        assert!(lease_failure_exit(true, true, true));
++        assert!(!lease_failure_exit(true, false, true));
++        assert!(!lease_failure_exit(true, true, false));
++        assert!(!lease_failure_exit(false, true, true));
++    }
++
+     use super::*;
+     use std::sync::mpsc::SyncSender;
+     use t1_bridge::match_workflow::MatchOutcome;
+diff --git a/crates/t1-platform/src/diagnostics.rs b/crates/t1-platform/src/diagnostics.rs
+index 8672b6d..69a80f6 100644
+--- a/crates/t1-platform/src/diagnostics.rs
++++ b/crates/t1-platform/src/diagnostics.rs
+@@ -6,6 +6,18 @@ use std::sync::OnceLock;
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ 
+ static ENABLED: AtomicBool = AtomicBool::new(false);
++// A refused SEP lease (sep-lease != 0, for example -103 Cancelled) leaves a broker that stays alive until 30 s of
++// idle time (auth_daemon.rs, IDLE_TIMEOUT); this flag, set even without diagnostics, makes the broker exit with a failure.
++static SEP_LEASE_FAILED: AtomicBool = AtomicBool::new(false);
++
++/// True after any SEP lease in this process ended with a nonzero status.
++pub fn sep_lease_failed() -> bool {
++    SEP_LEASE_FAILED.load(Ordering::SeqCst)
++}
++
++const fn is_lease_failure(stage: Stage, code: i32) -> bool {
++    matches!(stage, Stage::SepLease) && code != 0
++}
+ static ENV_ENABLED: OnceLock<bool> = OnceLock::new();
+ static RECORDS: AtomicUsize = AtomicUsize::new(0);
+ const RECORD_LIMIT: usize = 4096;
+@@ -212,6 +224,9 @@ pub fn observe<T, E>(
+ 
+ /// Emits a numeric adapter return code before the caller maps it to a category.
+ pub fn native(component: Component, stage: Stage, code: i32) {
++    if is_lease_failure(stage, code) {
++        SEP_LEASE_FAILED.store(true, Ordering::SeqCst);
++    }
+     emit(Record::new(
+         component,
+         stage,
+@@ -283,6 +298,15 @@ fn keystore_records(selector: u8, status: i32, outer: i8, inner: i32) -> [Option
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn sep_lease_failure_is_only_a_nonzero_lease_status() {
++        assert!(is_lease_failure(Stage::SepLease, -103));
++        assert!(is_lease_failure(Stage::SepLease, 1));
++        assert!(!is_lease_failure(Stage::SepLease, 0));
++        assert!(!is_lease_failure(Stage::SepCleanup, -103));
++        assert!(!is_lease_failure(Stage::Enroll, -103));
++    }
++
+     use super::*;
+ 
+     #[test]

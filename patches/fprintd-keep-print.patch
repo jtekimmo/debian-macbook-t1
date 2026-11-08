@@ -1,0 +1,101 @@
+--- a/src/device.c
++++ b/src/device.c
+@@ -114,6 +114,7 @@
+   FpPrint   *verify_data;
+   GPtrArray *identify_data;
+   int        enroll_data;
++  gboolean   enroll_replace; /* the finger is already enrolled: the old print is deleted only after a successful enrolment */
+ 
+   /* whether we're running an identify, or a verify */
+   FprintDeviceAction     current_action;
+@@ -2002,6 +2003,31 @@
+   return template;
+ }
+ 
++/* gallery for the identify step of an enrolment, without the print it replaces (same user, same finger) */
++static GPtrArray *
++enroll_gallery (FprintDevice *rdev)
++{
++  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
++  GPtrArray *all = load_all_prints (rdev);
++  g_autoptr(SessionData) session = NULL;
++  guint i;
++
++  if (!priv->enroll_replace)
++    return all;
++
++  session = session_data_get (priv);
++  for (i = all->len; i > 0; i--)
++    {
++      FpPrint *pr = g_ptr_array_index (all, i - 1);
++
++      if (session && fp_print_get_finger (pr) == (FpFinger) priv->enroll_data &&
++          g_strcmp0 (fp_print_get_username (pr), session->username) == 0)
++        g_ptr_array_remove_index (all, i - 1);
++    }
++
++  return all;
++}
++
+ static void
+ enroll_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+ {
+@@ -2046,10 +2072,22 @@
+   if (print)
+     {
+       int r;
++
++      /* enrolment succeeded: only now is the old print of the same finger deleted */
++      if (priv->enroll_replace)
++        {
++          g_autoptr(SessionData) session = session_data_get (priv);
++          g_autoptr(GError) del_error = NULL;
++
++          if (session && !delete_enrolled_fingers (rdev, session->username, priv->enroll_data, &del_error))
++            g_warning ("Could not delete the replaced print after a successful enroll: %s",
++                       del_error ? del_error->message : "unknown");
++        }
+       r = store.print_data_save (print);
+       if (r != 0)
+         name = "enroll-failed";
+     }
++  priv->enroll_replace = FALSE;
+ 
+   g_signal_emit (rdev, signals[SIGNAL_ENROLL_STATUS], 0, name, TRUE);
+ 
+@@ -2105,7 +2143,7 @@
+         {
+           g_autoptr(GPtrArray) all_prints = NULL;
+ 
+-          all_prints = load_all_prints (rdev);
++          all_prints = enroll_gallery (rdev);
+           fp_device_identify (priv->dev,
+                               all_prints,
+                               priv->current_cancellable,
+@@ -2211,14 +2249,9 @@
+       return TRUE;
+     }
+ 
+-  if (existing_print)
+-    {
+-      if (!delete_enrolled_fingers (rdev, session->username, finger, &error))
+-        {
+-          g_dbus_method_invocation_return_gerror (invocation, error);
+-          return TRUE;
+-        }
+-    }
++  /* upstream deletes the existing print here BEFORE the enrolment (a failure left the finger erased);
++   * now it is kept and replaced in enroll_cb only if the enrolment succeeds. */
++  priv->enroll_replace = (existing_print != NULL);
+ 
+   g_debug ("start enrollment device %d finger %d", priv->id, finger);
+ 
+@@ -2240,7 +2273,7 @@
+   if (fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_IDENTIFY) &&
+       !fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_DUPLICATES_CHECK))
+     {
+-      g_autoptr(GPtrArray) all_prints = load_all_prints (rdev);
++      g_autoptr(GPtrArray) all_prints = enroll_gallery (rdev);
+ 
+       /* We (now) have the policy that there must be no duplicate prints.
+        * We need to do this for MoC devices, as their "identify" function

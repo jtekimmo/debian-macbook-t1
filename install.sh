@@ -2,7 +2,8 @@
 # Installer for the pieces proven on a MacBookPro13,2 (T1 chip) running Debian 13.
 # Idempotent: every step checks the current state and only changes what differs.
 # Run as root:   sudo ./install.sh [--dry-run] [--force] [--wifi-mac AA:BB:CC:DD:EE:FF]
-#                                  [--t1bridge-src DIR] [--rename-owner OLD NEW]
+#                                  [--t1bridge-src DIR] [--fprintd-src DIR] [--fprintd-debug]
+#                                  [--rename-owner OLD NEW]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -13,16 +14,18 @@ NVRAM_SHA_1="a74cbb0abc4e8a43"
 NVRAM_SHA_2="7e383442dd44a9"
 NVRAM_SHA_3="6263079c102787"
 NVRAM_SHA_4="fbe0758e67614ca79df2"
-DRY=0; FORCE=0; WIFI_MAC=""; T1_SRC=""; REN_OLD=""; REN_NEW=""
+DRY=0; FORCE=0; WIFI_MAC=""; T1_SRC=""; FP_SRC=""; FP_DEBUG=0; REN_OLD=""; REN_NEW=""
 CHANGED=0
 
-usage() { sed -n '2,5p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,6p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case $1 in
         --dry-run) DRY=1 ;;
         --force) FORCE=1 ;;
         --wifi-mac) WIFI_MAC=${2:?--wifi-mac needs a value}; shift ;;
         --t1bridge-src) T1_SRC=${2:?--t1bridge-src needs a directory}; shift ;;
+        --fprintd-src) FP_SRC=${2:?--fprintd-src needs a directory}; shift ;;
+        --fprintd-debug) FP_DEBUG=1 ;;
         --rename-owner) REN_OLD=${2:?--rename-owner needs OLD NEW}; REN_NEW=${3:?--rename-owner needs OLD NEW}; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -47,7 +50,7 @@ fi
 put() {
     local dst=$1 mode=$2 src=$3
     if [ -f "$dst" ] && cmp -s "$src" "$dst" && [ "$(stat -c %a "$dst")" = "$mode" ]; then skip "$dst"; return 0; fi
-    act "install $dst"
+    act "install $dst"; PUT_CHANGED=1
     [ "$DRY" = 1 ] || install -D -m "$mode" "$src" "$dst"
 }
 
@@ -64,18 +67,40 @@ else skip "packages"; fi
 put /etc/modprobe.d/t1bridge.conf 644 "$HERE/conf/t1bridge.modprobe.conf"
 put /etc/modules-load.d/t1bridge.conf 644 "$HERE/conf/t1bridge.modules-load.conf"
 
-# --- 3. t1bridge Touch Bar: F1-F12 by default (patch for the t1bridge sources) -----
-# t1bridge itself is not shipped here: get v0.1.12 from its own repository (see README).
+# --- 3. t1bridge sources: F1-F12 by default, and the Touch ID broker leaves after a refused SEP lease --------
+# t1bridge itself is not shipped here: get v0.1.12 from its own repository (see README). Both patches apply to the
+# same tree, in this order; you build and install t1bridge yourself afterwards.
+# apply_patch DIR PATCH LABEL : apply PATCH in DIR unless it is already applied
+apply_patch() {
+    local dir=$1 p=$2 label=$3
+    if patch -p1 -R --dry-run -s -d "$dir" < "$p" >/dev/null 2>&1; then skip "$label already applied in $dir"
+    elif patch -p1 --dry-run -s -d "$dir" < "$p" >/dev/null 2>&1; then
+        act "apply $label in $dir (then rebuild, see README)"
+        [ "$DRY" = 1 ] || patch -p1 -s -d "$dir" < "$p"
+    else echo "$label does not apply cleanly in $dir (wrong version? see README)" >&2; exit 1; fi
+}
 if [ -n "$T1_SRC" ]; then
-    P="$HERE/patches/t1bridge-touchbar-fkeys.patch"
-    if patch -p1 -R --dry-run -s -d "$T1_SRC" < "$P" >/dev/null 2>&1; then skip "F1-F12 patch already applied in $T1_SRC"
-    elif patch -p1 --dry-run -s -d "$T1_SRC" < "$P" >/dev/null 2>&1; then
-        act "apply F1-F12 patch in $T1_SRC (then rebuild t1bridge, see README)"
-        [ "$DRY" = 1 ] || patch -p1 -s -d "$T1_SRC" < "$P"
-    else echo "patch does not apply cleanly in $T1_SRC (is it t1bridge v0.1.12?)" >&2; exit 1; fi
+    apply_patch "$T1_SRC" "$HERE/patches/t1bridge-touchbar-fkeys.patch" "t1bridge F1-F12 patch"
+    apply_patch "$T1_SRC" "$HERE/patches/t1bridge-sep-lease.patch" "t1bridge SEP-lease patch"
 else
-    say "skip: no --t1bridge-src given, F1-F12 patch not applied (patches/t1bridge-touchbar-fkeys.patch)"
+    say "skip: no --t1bridge-src given, t1bridge patches not applied (patches/t1bridge-*.patch)"
 fi
+# The Touch ID broker waits for the import of Apple's machine data (drop-in, no rebuild needed).
+PUT_CHANGED=0
+put /etc/systemd/system/t1-touchid-auth.service.d/after-import.conf 644 "$HERE/conf/t1bridge-after-import.conf"
+
+# --- 3b. fprintd sources: the old print is deleted only after a successful enrolment -------------------------
+# Upstream fprintd deletes the existing print of the finger BEFORE the enrolment, so a failed enrolment leaves the finger
+# erased. The patch is for fprintd 1.94.5 (commit b54a007); you build and install it yourself (README).
+if [ -n "$FP_SRC" ]; then
+    apply_patch "$FP_SRC" "$HERE/patches/fprintd-keep-print.patch" "fprintd keep-print patch"
+else
+    say "skip: no --fprintd-src given, fprintd patch not applied (patches/fprintd-keep-print.patch)"
+fi
+if [ "$FP_DEBUG" = 1 ]; then
+    put /etc/systemd/system/fprintd.service.d/debug.conf 644 "$HERE/conf/fprintd-debug.conf"
+else say "skip: fprintd debug log not asked (--fprintd-debug, optional)"; fi
+if [ "$PUT_CHANGED" = 1 ] && [ "$DRY" != 1 ]; then systemctl daemon-reload; fi
 
 # --- 4. Howdy: GStreamer fallback for the H.264-only camera -----------------------
 FOUND=0
@@ -90,6 +115,10 @@ done
 
 # --- 5. logind: the Touch ID sensor is the power button ---------------------------
 put /etc/systemd/logind.conf.d/90-mac-touchid.conf 644 "$HERE/conf/90-touchid-power-key.conf"
+# usbmuxd's own rule would put the T1 iBridge in USB configuration 0 (Touch Bar and camera interfaces gone); /etc wins over /lib
+PUT_CHANGED=0
+put /etc/udev/rules.d/39-usbmuxd.rules 644 "$HERE/conf/39-usbmuxd-sans-ibridge.rules"
+if [ "$PUT_CHANGED" = 1 ] && [ "$DRY" != 1 ]; then udevadm control --reload; fi
 
 # --- 6. ufw: xART (Touch ID) needs 61500/tcp on the private T1 link only ----------
 LINK=""
