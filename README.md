@@ -41,20 +41,20 @@ the T1 link. Scripts and small patches only; [t1bridge](https://github.com/stand
 All of this was run on the one tested machine. What was **not** shown is said in each item.
 
 1. **The broker waits for the import of Apple's machine data.** `t1-touchid-auth.service` now has `Wants=` and `After=` on
-   `t1bridge-import.service` (`conf/t1bridge-after-import.conf`, a drop-in). The import takes 0.22 s (measured once). `Wants=`, not
-   `Requires=`: if the import fails the broker still starts. Reread on the machine with `systemctl cat`; **not yet checked across
+   `t1bridge-import.service` (`conf/t1bridge-after-import.conf`, a drop-in). The import takes 0.22 s (the unit run once by hand on the tested machine). `Wants=`, not
+   `Requires=`: if the import fails the broker still starts. Drop-in installed and reread with `systemctl cat` after `daemon-reload` on the tested machine; **not yet checked across
    a reboot**.
 2. **The broker leaves after a refused SEP lease** (`patches/t1bridge-sep-lease.patch`, for t1bridge v0.1.12). Without it,
    a lease refused with status -103 (`Cancelled`, `sep.rs:102`) left the broker running until its 30 s idle timeout
    (`auth_daemon.rs:470-490`), so the next attempt talked to a broker in a bad state. With the patch it exits with a failure once
-   nothing is running, and the next attempt gets a fresh one. It was built and its unit test passes (the test fails without the
-   patch); the patched broker is installed. **A refused lease was not provoked afterwards**, so the exit itself has not been seen
+   nothing is running, and the next attempt gets a fresh one. It was built **on the tested machine** and its unit test passed there (the test fails without the
+   patch); the patched broker was then installed, checked by its sha256. **A refused lease was not provoked afterwards**, so the exit itself has not been seen
    on the real hardware.
 3. **fprintd keeps the old print until the new enrolment succeeds** (`patches/fprintd-keep-print.patch`, for fprintd 1.94.5,
    commit `b54a007`). Upstream deletes the existing print of the same finger *before* the enrolment starts
    (`src/device.c`), so a failed enrolment left the finger erased: this happened on the tested machine (a left index finger
-   was lost that way). The patch deletes it in `enroll_cb`, only after a successful enrolment. It builds and the daemon starts
-   with it; **the case it exists for (re-enrolling a finger that is already enrolled, then failing or succeeding) has not been
+   was lost that way). The patch deletes it in `enroll_cb`, only after a successful enrolment. It was built on the tested machine and installed (sha256 checked); the daemon starts
+   with it and `fprintd-list` still shows the remaining print; **the case it exists for (re-enrolling a finger that is already enrolled, then failing or succeeding) has not been
    tested yet**. If the T1 itself refuses a duplicate, the enrolment fails and the old print stays.
 4. **Power button.** The Touch ID sensor is the power button. logind ignoring it (`conf/90-touchid-power-key.conf`) was not enough: on
    Xfce, `xfce4-power-manager` itself turned the machine off during a fingerprint enrolment. Per user:
@@ -63,11 +63,11 @@ All of this was run on the one tested machine. What was **not** shown is said in
    ```
    Set and read back as 0 on the tested machine; the enrolment that shut the machine down has not been repeated since.
 5. **Optional debug log of fprintd** (`conf/fprintd-debug.conf`, `install.sh --fprintd-debug`): sets `G_MESSAGES_DEBUG=all`
-   for `fprintd.service`. It only exists to find the cause below; remove it afterwards. It was seen to produce debug lines at the
-   daemon start.
+   for `fprintd.service`. It only exists to find the cause below; remove it afterwards. The daemon start was seen in the journal with the
+   debug lines, on the tested machine.
 6. **iBridge USB rule.** Debian's `usbmuxd` rule would put the T1 iBridge in USB configuration 0 (Touch Bar and camera
    interfaces gone). `conf/39-usbmuxd-sans-ibridge.rules` is a copy without the iBridge; `install.sh` puts it in
-   `/etc/udev/rules.d/`. Measured once on the tested machine.
+   `/etc/udev/rules.d/`. The loss of the interfaces with Debian's rule was measured on the tested machine; the copy without the iBridge is the one in use there.
 
 **Cause of the failed enrolments: not proven.** On the tested machine fingerprint enrolments failed with `sep-lease` status
 -103 several times in a day. Nothing in the journal shows who cancelled the lease (no timeout, no service stop). The most
@@ -83,9 +83,11 @@ stopped before returning, and the option `"retry_secs": 30`, which silently rela
 the services listed in `"retry_services"` (here `lightdm`)**; sudo, su, polkit and the screen locker get a single face attempt and the
 password can be typed at once. Files: `conf/pam-any/` (three sub-stacks and a `pam-auth-update` profile).
 
-Tested on a **non-Apple laptop** only (lock screen: one silent face attempt then the password field; login screen: the 30 s retry; sudo
-answers at once). **Not run on the MacBook T1.** You build pam-any yourself (`cargo build --release --locked`) and adjust the path of
-`pam_howdy.so` in `conf/pam-any/pam-any-howdy`.
+Measured on the tested MacBookPro13,2, with the PAM stacks **replayed by hand with nobody in front of the machine**
+(not through the real screens): under `xfce4-screensaver`, one silent face attempt and the password prompt at 7.0 s (Howdy's 5 s timeout
+plus opening the camera; not under 6 s); a real `sudo`, the password prompt at 0.0 s; `lightdm`, 5 retries and the prompt at
+34.7 s, no message shown. **Not yet seen on the real login screen (LightDM) or the real screen saver.** You build pam-any
+yourself (`cargo build --release --locked`) and adjust the path of `pam_howdy.so` in `conf/pam-any/pam-any-howdy`.
 
 ## Install
 
