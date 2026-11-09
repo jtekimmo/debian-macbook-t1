@@ -186,6 +186,16 @@ name collisions and the progress bar were rehearsed on fake data. The messages o
 - macOS's EFI partition must stay: it holds the T1 firmware that t1bridge imports.
 - Back out: remove the files `install.sh` printed, uninstall t1bridge, reboot.
 
+## Changes followed from the source scripts
+
+<!-- mac-github:start -->
+Written automatically each time the source scripts change something for the MacBook Pro. Messages are copied from the commits of the source scripts (in French). A change listed here is not proof that it was tested on a Mac: see the table above and Known issues.
+
+| Release | Date | Source tag | What changed (messages of the source commits) | Files |
+|---|---|---|---|---|
+| v0.3.0 | 2026-11-08 | v2.122 | Mac, couvercle ferme = arret sur batterie seulement, ecran eteint sur secteur | `scripts/mac-power-settings.sh` |
+<!-- mac-github:end -->
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE). Third-party licences: [THIRD_PARTY.md](THIRD_PARTY.md).
